@@ -36,6 +36,7 @@ const MaxParent = 100
 // relative path of parent.
 func MergeParents(ctx context.Context, mavenClient *datasource.MavenRegistryAPIClient, result *maven.Project, current maven.Parent, start int, path string, allowLocal bool) error {
 	currentPath := path
+	rootPath := FindProjectRoot(path)
 	visited := make(map[maven.ProjectKey]bool, MaxParent)
 	for n := start; n < MaxParent; n++ {
 		if current.GroupID == "" || current.ArtifactID == "" || current.Version == "" {
@@ -50,7 +51,7 @@ func MergeParents(ctx context.Context, mavenClient *datasource.MavenRegistryAPIC
 		var proj maven.Project
 		parentFound := false
 		if allowLocal {
-			if parentPath := ParentPOMPath(currentPath, string(current.RelativePath)); parentPath != "" {
+			if parentPath := ParentPOMPath(currentPath, string(current.RelativePath), rootPath); parentPath != "" {
 				currentPath = parentPath
 				f, err := os.Open(parentPath)
 				if err != nil {
@@ -119,22 +120,79 @@ func ProjectKey(proj maven.Project) maven.ProjectKey {
 	return proj.ProjectKey
 }
 
+
+// FindProjectRoot attempts to find the root of the project by walking up the directory
+// tree looking for a .git directory. If it reaches the root of the filesystem without
+// finding one, it falls back to the directory of the initial path.
+func FindProjectRoot(startPath string) string {
+	absPath, err := filepath.Abs(startPath)
+	if err != nil {
+		return filepath.Dir(startPath)
+	}
+
+	dir := filepath.Dir(absPath)
+	for {
+		if info, err := os.Stat(filepath.Join(dir, ".git")); err == nil && info.IsDir() {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir { // Reached filesystem root
+			break
+		}
+		dir = parent
+	}
+
+	return filepath.Dir(absPath)
+}
+
+// IsWithinRoot checks if targetPath is within rootPath.
+func IsWithinRoot(rootPath, targetPath string) bool {
+	rootAbs, err := filepath.Abs(rootPath)
+	if err != nil {
+		return false
+	}
+	targetAbs, err := filepath.Abs(targetPath)
+	if err != nil {
+		return false
+	}
+
+	rel, err := filepath.Rel(rootAbs, targetAbs)
+	if err != nil {
+		return false
+	}
+
+	// Clean the path to remove extraneous . or ..
+	rel = filepath.Clean(rel)
+
+	if rel == ".." || strings.HasPrefix(rel, ".." + string(filepath.Separator)) {
+		return false
+	}
+
+	return true
+}
+
 // ParentPOMPath resolves the path to the parent POM in the same manner as Maven.
 //
 // That is, it first looks for the parent POM in the 'relativePath' directory,
 // then in the parent directory, and finally in the remote repository.
-func ParentPOMPath(currentPath, relativePath string) string {
+func ParentPOMPath(currentPath, relativePath, rootPath string) string {
 	if relativePath == "" {
 		relativePath = "../pom.xml"
 	}
 	path := filepath.Join(filepath.Dir(currentPath), relativePath)
 	if info, err := os.Stat(path); err == nil {
 		if !info.IsDir() {
+			if rootPath != "" && !IsWithinRoot(rootPath, path) {
+				return ""
+			}
 			return path
 		}
 		// Current path is a directory, so look for pom.xml in the directory.
 		path = filepath.Join(path, "pom.xml")
 		if _, err := os.Stat(path); err == nil {
+			if rootPath != "" && !IsWithinRoot(rootPath, path) {
+				return ""
+			}
 			return path
 		}
 	}
